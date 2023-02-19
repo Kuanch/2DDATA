@@ -1,2 +1,1 @@
-# 2DDASS
-2D Detection Assiseted Semantic Segmentation on Lidar Point Cloud
+# 2DDASS: 2D Detection Annotations Transmittable Aggregation for Semantic Segmentation on Point Cloud
