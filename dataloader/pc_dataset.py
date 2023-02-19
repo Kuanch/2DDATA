@@ -5,7 +5,8 @@ import numpy as np
 from PIL import Image
 from torch.utils import data
 from pathlib import Path
-from nuscenes.utils import splits
+from pyquaternion import Quaternion
+from nuscenes.utils import splits, geometry_utils
 
 REGISTERED_PC_DATASET_CLASSES = {}
 
@@ -132,8 +133,8 @@ class SemanticKITTI(data.Dataset):
 
 @register_dataset
 class nuScenes(data.Dataset):
-    def __init__(self, config, data_path, imageset='train', num_vote=1, debug=False):
-        if debug:
+    def __init__(self, config, data_path, imageset='train', num_vote=1):
+        if config.debug:
             version = 'v1.0-mini'
             scenes = splits.mini_train
         else:
@@ -246,6 +247,44 @@ class nuScenes(data.Dataset):
                          'cam_token': cam_token}
                     )
 
+    def _box3d_to_box2d(self, boxes, img_size, intrinsic, ego_pose, calibrated_sensor):
+        def to_cam_coord(box):
+            # Move box to ego vehicle coord system
+            box.translate(-np.array(ego_pose['translation']))
+            box.rotate(Quaternion(ego_pose['rotation']).inverse)
+
+            #  Move box to sensor coord system
+            box.translate(-np.array(calibrated_sensor['translation']))
+            box.rotate(Quaternion(calibrated_sensor['rotation']).inverse)
+            if not geometry_utils.box_in_image(box, intrinsic,
+                                               img_size, geometry_utils.BoxVisibility.ALL):
+                return None
+            return box
+
+        boxes2d = []
+        for box in boxes:
+            box = to_cam_coord(box)
+            if box is None:
+                continue
+
+            corners = box.corners()
+            x = corners[0, :]
+            y = corners[1, :]
+            z = corners[2, :]
+            x_y_z = np.array((x, y, z))
+            orthographic = np.dot(intrinsic, x_y_z)
+            perspective_x = orthographic[0] / orthographic[2]
+            perspective_y = orthographic[1] / orthographic[2]
+            # perspective_z = orthographic[2] / orthographic[2]
+
+            min_x = int(np.min(perspective_x))
+            max_x = int(np.max(perspective_x))
+            min_y = int(np.min(perspective_y))
+            max_y = int(np.max(perspective_y))
+            boxes2d.append((min_x, max_x, min_y, max_y))
+
+        return boxes2d
+
     def __getitem__(self, index):
         pointcloud, sem_label, instance_label, lidar_sample_token = self.loadDataByIndex(index)
         sem_label = np.vectorize(self.learning_map.__getitem__)(sem_label)
@@ -264,6 +303,12 @@ class nuScenes(data.Dataset):
                                       cam['calibrated_sensor_token'])
         pose_record_cam = self.nusc.get('ego_pose', cam['ego_pose_token'])
 
+        boxes = self.nusc.get_boxes(cam_sample_token)
+        intrinsic = np.asarray(cs_record_cam['camera_intrinsic'])
+        boxes2d = self._box3d_to_box2d(boxes, (cam['width'], cam['height']),
+                                       intrinsic,
+                                       pose_record_cam, cs_record_cam)
+
         calib_infos = {
             "lidar2ego_translation": cs_record_lidar['translation'],
             "lidar2ego_rotation": cs_record_lidar['rotation'],
@@ -279,6 +324,7 @@ class nuScenes(data.Dataset):
         data_dict = {}
         data_dict['xyz'] = pointcloud[:, :3]
         data_dict['img'] = image
+        data_dict['boxes2d'] = boxes2d
         data_dict['calib_infos'] = calib_infos
         data_dict['labels'] = sem_label.astype(np.uint8)
         data_dict['signal'] = pointcloud[:, 3:4]
